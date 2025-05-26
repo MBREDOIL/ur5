@@ -16,12 +16,27 @@ import os
 from datetime import datetime, timedelta
 import asyncio
 
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+
 # Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Dummy server for health check
+def start_dummy_server():
+    class SimpleHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Telegram bot is running.')
+
+    server = HTTPServer(('0.0.0.0', 8080), SimpleHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
 
 BASE_URL = "http://14.139.56.104"
 DEFAULT_TIMEOUT = 80
@@ -790,12 +805,17 @@ async def submit_result_request(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text("🚨 An error occurred. Start over with /start")
 
 def main() -> None:
-    # Create application with JobQueue
+    start_dummy_server()
+
+    TOKEN = os.getenv("BOT_TOKEN")
+    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+
     application = Application.builder() \
-        .token("8100632837:AAG8y2rSMgSOFcF5fJwHe2vfhOSiBlefFfc") \
+        .token(TOKEN) \
         .job_queue(JobQueue()) \
         .build()
 
+    
     # Command handlers
     application.add_handler(CommandHandler("start", start))
 

@@ -47,6 +47,7 @@ MIN_ITEMS = 10
 MAX_ITEMS = 80
 CACHE_TIME = timedelta(minutes=15)
 SESSION_TIMEOUT = 300  # 5 minutes
+SESSION_DURATION = 900  # 15 minutes in seconds
 
 # Updated User Agents
 USER_AGENTS = [
@@ -69,6 +70,7 @@ class ResultCache:
     def __init__(self):
         self.results = []
         self.timestamp = datetime.min
+        self.active_sessions = {}
 
 cache = ResultCache()
 
@@ -83,7 +85,57 @@ async def get_headers():
         "Cache-Control": "no-cache"
     }
 
+
 async def fetch_results(session, timeout):
+    """Stream and parse results with early return"""
+    try:
+        if datetime.now() - cache.timestamp < CACHE_TIME:
+            return cache.results
+
+        cache.results = []
+        buffer = ""
+        async with session.get(BASE_URL, headers=await get_headers(), timeout=timeout) as response:
+            async for chunk in response.content.iter_chunked(1024):
+                buffer += chunk.decode('utf-8', errors='ignore')
+                
+                while True:
+                    table_start = buffer.find('<table id="ResultList"')
+                    if table_start == -1:
+                        break
+                    
+                    table_end = buffer.find('</table>', table_start)
+                    if table_end == -1:
+                        break
+                        
+                    table_html = buffer[table_start:table_end+8]
+                    soup = BeautifulSoup(table_html, 'html.parser')
+                    
+                    new_results = []
+                    for row in soup.find_all('tr'):
+                        cols = row.find_all('td')
+                        if len(cols) == 2 and (link := cols[1].find('a')):
+                            new_results.append({
+                                'name': re.sub(r'\s+', ' ', link.text.strip()),
+                                'url': BASE_URL + link['href'] if not link['href'].startswith('http') else link['href']
+                            })
+                    
+                    cache.results.extend(new_results)
+                    buffer = buffer[table_end+8:]
+                    
+                    # Return early when minimum results reached
+                    if len(cache.results) >= MIN_RESULTS_TO_SHOW:
+                        cache.timestamp = datetime.now()
+                        return cache.results
+
+        cache.timestamp = datetime.now()
+        return cache.results
+
+    except Exception as e:
+        logger.error(f"Fetch error: {e}")
+        return []
+                        
+
+#async def fetch_results(session, timeout):
     """Fetch results with caching and retry logic"""
     try:
         if datetime.now() - cache.timestamp < CACHE_TIME:
@@ -120,6 +172,37 @@ async def fetch_results(session, timeout):
         return []
 
 def generate_keyboard(results, page, items_per_page):
+    """Generate dynamic paginated keyboard"""
+    items_per_page = max(MIN_ITEMS, min(MAX_ITEMS, items_per_page))
+    start = page * items_per_page
+    page_results = results[start:start+items_per_page]
+    
+    buttons = [
+        [InlineKeyboardButton(f"{start+i+1}. {res['name'][:30]}", callback_data=f"result_{start+i}")]
+        for i, res in enumerate(page_results)
+    ]
+    
+    # Navigation controls
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton("◀️ Back", callback_data="page_back"))
+    if start+items_per_page < len(results):
+        nav_buttons.append(InlineKeyboardButton("▶️ Next", callback_data="page_next"))
+    
+    if nav_buttons:
+        buttons.append(nav_buttons)
+    
+    buttons.append([InlineKeyboardButton("❌ Cancel Session", callback_data="main_cancel")])
+    navigation.append(InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu"))
+    
+    if navigation:
+        keyboard.append(navigation)
+    
+    return InlineKeyboardMarkup(buttons)
+
+# Keep other handlers (settings, help, etc) similar to original
+
+#def generate_keyboard(results, page, items_per_page):
     """Generate paginated keyboard"""
     start = page * items_per_page
     end = start + items_per_page
@@ -146,7 +229,9 @@ async def main_menu(update: Update):
     keyboard = [
         [InlineKeyboardButton("📊 Check Results", callback_data="main_results")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="main_settings")],
-        [InlineKeyboardButton("❓ Help Guide", callback_data="main_help")]
+        [InlineKeyboardButton("❓ Help Guide", callback_data="main_help")],
+        [InlineKeyboardButton("❌ Cancel Session", callback_data="main_cancel")]
+    ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -161,7 +246,132 @@ async def main_menu(update: Update):
             reply_markup=reply_markup
         )
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "main_cancel":
+        await clear_session(update, context)
+        return
+    
+    # Existing menu handling...
+
+async def show_results_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        # Init loading message
+        msg = await update.callback_query.edit_message_text(
+            "⏳ Loading initial results... (0/100 loaded)"
+        )
+        
+        # Start background tasks
+        asyncio.create_task(process_results(context, msg.chat_id, msg.message_id))
+        asyncio.create_task(update_progress(context, msg.chat_id, msg.message_id))
+        
+    except Exception as e:
+        logger.error(f"Results error: {e}")
+
+async def process_results(context, chat_id, message_id):
+    """Process results with early return"""
+    try:
+        connector = aiohttp.TCPConnector(limit=50, ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            results = await fetch_results(session, DEFAULT_TIMEOUT)
+            
+            # Start session timer
+            end_time = datetime.now() + timedelta(seconds=SESSION_DURATION)
+            cache.active_sessions[chat_id] = {
+                'message_id': message_id,
+                'end_time': end_time
+            }
+            
+            context.job_queue.run_once(
+                update_session_timer,
+                when=10,
+                chat_id=chat_id,
+                data={'message_id': message_id, 'end_time': end_time},
+                name=f"session_{chat_id}"
+            )
+            
+            # Show first page
+            items = context.user_data.get('items', DEFAULT_ITEMS)
+            keyboard = generate_keyboard(results, 0, items)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"📋 {len(results)} results available:",
+                reply_markup=keyboard
+            )
+
+    except Exception as e:
+        logger.error(f"Processing error: {e}")
+
+async def update_progress(context, chat_id, message_id):
+    """Update loading progress every 2 seconds"""
+    for _ in range(50):  # Max 100 seconds waiting
+        if len(cache.results) >= MIN_RESULTS_TO_SHOW:
+            break
+            
+        try:
+            await context.bot.edit_message_text(
+                f"⏳ Loading results... ({len(cache.results)}/100 loaded)",
+                chat_id=chat_id,
+                message_id=message_id
+            )
+            await asyncio.sleep(2)
+        except:
+            break
+
+async def update_session_timer(context: ContextTypes.DEFAULT_TYPE):
+    """Update session timer every 10 seconds"""
+    job = context.job
+    remaining = job.data['end_time'] - datetime.now()
+    
+    if remaining.total_seconds() <= 0:
+        await clear_session_by_id(context, job.chat_id)
+        return
+    
+    try:
+        await context.bot.edit_message_text(
+            f"🌐 Active Session | Time left: {remaining.seconds//60:02d}:{remaining.seconds%60:02d}\n"
+            f"✅ Total results: {len(cache.results)}",
+            chat_id=job.chat_id,
+            message_id=job.data['message_id']
+        )
+        
+        # Reschedule
+        context.job_queue.run_once(
+            update_session_timer,
+            when=10,
+            chat_id=job.chat_id,
+            data=job.data,
+            name=f"session_{job.chat_id}"
+        )
+    except Exception as e:
+        logger.error(f"Timer error: {e}")
+
+async def clear_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clear user session completely"""
+    chat_id = update.callback_query.message.chat_id
+    await clear_session_by_id(context, chat_id)
+    await update.callback_query.edit_message_text("✅ Session cleared successfully")
+
+async def clear_session_by_id(context, chat_id):
+    """Clear session by chat ID"""
+    try:
+        # Remove from cache
+        if chat_id in cache.active_sessions:
+            del cache.active_sessions[chat_id]
+            
+        # Cancel jobs
+        for job in context.job_queue.get_jobs_by_name(f"session_{chat_id}"):
+            job.schedule_removal()
+            
+        # Clear user data
+        context.user_data.clear()
+        
+    except Exception as e:
+        logger.error(f"Session clear error: {e}")
+        
+#async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await main_menu(update)
 
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -174,10 +384,12 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_settings_menu(update, context)
     elif query.data == "main_help":
         await show_help_menu(update, context)
+    elif query.data == "main_cancel":
+        await clear_session(update, context)
     elif query.data == "main_menu":
         await main_menu(update)
 
-async def show_results_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#async def show_results_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['page'] = 0
     try:
         timeout = context.user_data.get('timeout', DEFAULT_TIMEOUT)
@@ -258,9 +470,9 @@ async def adjust_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [
-            InlineKeyboardButton("➖5s", callback_data="timeout_-5"),
+            InlineKeyboardButton("➖10s", callback_data="timeout_-10"),
             InlineKeyboardButton(f"{current_timeout}s", callback_data="none"),
-            InlineKeyboardButton("➕5s", callback_data="timeout_+5")
+            InlineKeyboardButton("➕10s", callback_data="timeout_+10")
         ],
         [InlineKeyboardButton("🔙 Back to Settings", callback_data="main_settings")]
     ]
